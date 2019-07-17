@@ -29,9 +29,16 @@ import (
 	"v2ray.com/core/proxy/freedom"
 
 	"v2ray.com/core/transport/internet"
+	"v2ray.com/core/transport/internet/kcp"
 	"v2ray.com/core/transport/internet/quic"
 	"v2ray.com/core/transport/internet/tls"
 	"v2ray.com/core/transport/internet/websocket"
+
+	"v2ray.com/core/transport/internet/headers/srtp"
+	dtls "v2ray.com/core/transport/internet/headers/tls"
+	"v2ray.com/core/transport/internet/headers/utp"
+	"v2ray.com/core/transport/internet/headers/wechat"
+	"v2ray.com/core/transport/internet/headers/wireguard"
 
 	vlog "v2ray.com/core/app/log"
 	clog "v2ray.com/core/common/log"
@@ -40,7 +47,7 @@ import (
 )
 
 var (
-	VERSION    = "custom"
+	VERSION = "custom"
 )
 
 var (
@@ -56,11 +63,20 @@ var (
 	cert       = flag.String("cert", "", "Path to TLS certificate file. Overrides certRaw. Default: ~/.acme.sh/{host}/fullchain.cer")
 	certRaw    = flag.String("certRaw", "", "Raw TLS certificate content. Intended only for Android.")
 	key        = flag.String("key", "", "(server) Path to TLS key file. Default: ~/.acme.sh/{host}/{host}.key")
-	mode       = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls).")
+	mode       = flag.String("mode", "websocket", "Transport mode: websocket, quic (enforced tls), mkcp.")
 	mux        = flag.Int("mux", 1, "Concurrent multiplexed connections (websocket client mode only).")
+	obfs       = flag.String("obfs", "none", "protocol obfuscation (quic/mkcp mode only)")
 	server     = flag.Bool("server", false, "Run in server mode")
 	logLevel   = flag.String("loglevel", "", "loglevel for v2ray: debug, info, warning (default), error, none.")
 	version    = flag.Bool("version", false, "Show current version of v2ray-plugin")
+
+	kcpMTU              = flag.Int("mtu", 1350, "MTU (mkcp)")
+	kcpTTI              = flag.Int("tti", 50, "TTI in ms (mkcp)")
+	kcpUplinkCapacity   = flag.Int("uplinkCapacity", 5, "Uplink capacity in MB/s (mkcp)")
+	kcpDownlinkCapacity = flag.Int("downlinkCapacity", 20, "Downlink capacity in MB/s (mkcp)")
+	kcpCongestion       = flag.Bool("congestion", false, "Congestion control switch (mkcp)")
+	kcpReadBuffer       = flag.Int("readBuffer", 2, "Read buffer size in MB (mkcp)")
+	kcpWriteBuffer      = flag.Int("writeBuffer", 2, "Write buffer size in MB (mkcp)")
 )
 
 func homeDir() string {
@@ -137,10 +153,55 @@ func generateConfig() (*core.Config, error) {
 		}
 		connectionReuse = true
 	case "quic":
-		transportSettings = &quic.Config{
+		qc := &quic.Config{
 			Security: &protocol.SecurityConfig{Type: protocol.SecurityType_NONE},
 		}
+
+		if *obfs != "" && *obfs != "none" {
+			switch *obfs {
+			case "srtp":
+				qc.Header = serial.ToTypedMessage(new(srtp.Config))
+			case "utp":
+				qc.Header = serial.ToTypedMessage(new(utp.Config))
+			case "wechat-video":
+				qc.Header = serial.ToTypedMessage(new(wechat.VideoConfig))
+			case "dtls":
+				qc.Header = serial.ToTypedMessage(new(dtls.PacketConfig))
+			case "wireguard":
+				qc.Header = serial.ToTypedMessage(new(wireguard.WireguardConfig))
+			}
+		}
+
+		transportSettings = qc
+
 		*tlsEnabled = true
+	case "mkcp":
+		kc := &kcp.Config{
+			Mtu:              &kcp.MTU{Value: uint32(*kcpMTU)},
+			Tti:              &kcp.TTI{Value: uint32(*kcpTTI)},
+			UplinkCapacity:   &kcp.UplinkCapacity{Value: uint32(*kcpUplinkCapacity)},
+			DownlinkCapacity: &kcp.DownlinkCapacity{Value: uint32(*kcpDownlinkCapacity)},
+			Congestion:       *kcpCongestion,
+			ReadBuffer:       &kcp.ReadBuffer{Size: uint32(*kcpReadBuffer)},
+			WriteBuffer:      &kcp.WriteBuffer{Size: uint32(*kcpWriteBuffer)},
+		}
+
+		if *obfs != "" && *obfs != "none" {
+			switch *obfs {
+			case "srtp":
+				kc.HeaderConfig = serial.ToTypedMessage(new(srtp.Config))
+			case "utp":
+				kc.HeaderConfig = serial.ToTypedMessage(new(utp.Config))
+			case "wechat-video":
+				kc.HeaderConfig = serial.ToTypedMessage(new(wechat.VideoConfig))
+			case "dtls":
+				kc.HeaderConfig = serial.ToTypedMessage(new(dtls.PacketConfig))
+			case "wireguard":
+				kc.HeaderConfig = serial.ToTypedMessage(new(wireguard.WireguardConfig))
+			}
+		}
+
+		transportSettings = kc
 	default:
 		return nil, newError("unsupported mode:", *mode)
 	}
@@ -273,6 +334,9 @@ func startV2Ray() (core.Server, error) {
 		if _, b := opts.Get("tls"); b {
 			*tlsEnabled = true
 		}
+		if c, b := opts.Get("obfs"); b {
+			*obfs = c
+		}
 		if c, b := opts.Get("host"); b {
 			*host = c
 		}
@@ -322,6 +386,55 @@ func startV2Ray() (core.Server, error) {
 				*remotePort = c
 			}
 		}
+		if c, b := opts.Get("mtu"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpMTU = i
+			} else {
+				logWarn("failed to parse mtu, use default value")
+			}
+		}
+		if c, b := opts.Get("tti"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpTTI = i
+			} else {
+				logWarn("failed to parse tti, use default value")
+			}
+		}
+		if c, b := opts.Get("uplinkCapacity"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpUplinkCapacity = i
+			} else {
+				logWarn("failed to parse uplinkCapacity, use default value")
+			}
+		}
+		if c, b := opts.Get("downlinkCapacity"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpDownlinkCapacity = i
+			} else {
+				logWarn("failed to parse downlinkCapacity, use default value")
+			}
+		}
+		if c, b := opts.Get("congestion"); b {
+			if i, err := strconv.ParseBool(c); err == nil {
+				*kcpCongestion = i
+			} else {
+				logWarn("failed to parse congestion, use default value")
+			}
+		}
+		if c, b := opts.Get("readBuffer"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpReadBuffer = i
+			} else {
+				logWarn("failed to parse readBuffer, use default value")
+			}
+		}
+		if c, b := opts.Get("writeBuffer"); b {
+			if i, err := strconv.Atoi(c); err == nil {
+				*kcpWriteBuffer = i
+			} else {
+				logWarn("failed to parse writeBuffer, use default value")
+			}
+		}
 	}
 
 	config, err := generateConfig()
@@ -343,17 +456,17 @@ func printCoreVersion() {
 }
 
 func printVersion() {
-    fmt.Println("v2ray-plugin", VERSION);
-    fmt.Println("Yet another SIP003 plugin for shadowsocks");
+	fmt.Println("v2ray-plugin", VERSION)
+	fmt.Println("Yet another SIP003 plugin for shadowsocks")
 }
 
 func main() {
 	flag.Parse()
 
-    if *version {
-        printVersion()
-        return
-    }
+	if *version {
+		printVersion()
+		return
+	}
 
 	logInit()
 
